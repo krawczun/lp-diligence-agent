@@ -21,7 +21,7 @@ export default async function ReportPage({ params }: { params: Promise<{ docId: 
       <header className="space-y-1">
         <div className="text-sm text-neutral-500 mono">{doc.doc_id}</div>
         <h1 className="text-2xl font-semibold">
-          {doc.entity} — {doc.period}
+          {doc.entity} · {doc.period}
         </h1>
         <div className="text-sm text-neutral-400">{doc.doc_type}</div>
       </header>
