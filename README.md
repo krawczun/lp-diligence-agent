@@ -2,14 +2,16 @@
 
 An agentic AI prototype that performs LP-side diligence on private-equity fund quarterly reports. Given a quarterly report, the agent runs a 9-item diligence checklist against the document and returns structured, citation-backed answers with explicit confidence tags. Designed for sophisticated LPs and fund-of-fund managers who read hundreds of these per quarter.
 
+**Live demo:** [lp-diligence.krawczun.com](https://lp-diligence.krawczun.com) · **Project writeup:** [krawczun.com/projects/lp-diligence-agent](https://krawczun.com/projects/lp-diligence-agent)
+
 ## What it does
 
 - Ingests LP-format quarterly reports (PDF) and SEC 10-Q filings (HTML)
 - Runs a 9-item diligence checklist against each document via a multi-step agent
 - Returns structured JSON with citations, confidence tags, and a refusal mode when data is missing
 - Exposes itself two ways:
-  - **MCP server** (`lp_diligence.mcp_server`) — usable directly from Claude Desktop
-  - **FastAPI server** (`lp_diligence.api`) — backs a Next.js demo UI
+  - **MCP server** (`lp_diligence.mcp_server`): usable directly from Claude Desktop
+  - **FastAPI server** (`lp_diligence.api`): backs a Next.js demo UI
 - Ships with a 20-question eval golden set and an LLM-judge eval harness
 
 ## The diligence checklist
@@ -27,8 +29,8 @@ An agentic AI prototype that performs LP-side diligence on private-equity fund q
 ## Corpus
 
 Five publicly available documents:
-- **PSERS Hamilton Lane Quarterly Reports** — Q2/Q3/Q4 2017, FOIA-released via the Pennsylvania Joint State Government Commission Act 5 archive. These are the closest public analog to true GP-to-LP quarterly communications and provide three consecutive quarters of the same portfolio for change-over-time analysis.
-- **Blackstone Private Equity Strategies Fund 10-Q** — Q1 and Q3 2025, registered SEC filings. Cover the fund-level fee detail and Level 1/2/3 valuation hierarchy that the PSERS reports redact.
+- **PSERS Hamilton Lane Quarterly Reports**: Q2/Q3/Q4 2017, FOIA-released via the Pennsylvania Joint State Government Commission Act 5 archive. These are the closest public analog to true GP-to-LP quarterly communications and provide three consecutive quarters of the same portfolio for change-over-time analysis.
+- **Blackstone Private Equity Strategies Fund 10-Q**: Q1 and Q3 2025, registered SEC filings. Cover the fund-level fee detail and Level 1/2/3 valuation hierarchy that the PSERS reports redact.
 
 See [data/corpus/MANIFEST.md](data/corpus/MANIFEST.md) for source URLs and provenance.
 
