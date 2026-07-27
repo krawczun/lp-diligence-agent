@@ -10,6 +10,7 @@ chunk_id is "{doc_id}:{section}:{chunk_idx}" so re-ingest is idempotent.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import struct
 from pathlib import Path
@@ -27,6 +28,33 @@ def _check_sqlite_vec_importable() -> None:
 
 def _vec_to_blob(vec: list[float]) -> bytes:
     return struct.pack(f"<{len(vec)}f", *vec)
+
+
+# FTS5 treats characters like " * ( ) : - AND OR NOT as query syntax, so a raw
+# natural-language question ("What was the fund's Q2 return?") is a syntax
+# error rather than a search. Rather than escape the grammar, reduce the query
+# to its bare terms and OR them: FTS5 ranks by bm25 anyway, so documents
+# matching more terms still float to the top.
+_FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._%/-]*")
+
+# Dropped because they match nearly every chunk and dilute the bm25 signal.
+_FTS_STOPWORDS = frozenset(
+    """a an and are as at be by for from how in is it of on or that the this to
+    was what when where which who why will with""".split()
+)
+
+
+def _fts_match_expression(query: str) -> str:
+    """Turn a natural-language question into a safe FTS5 MATCH expression."""
+    tokens = _FTS_TOKEN_RE.findall(query.lower())
+    terms = [t for t in tokens if t not in _FTS_STOPWORDS and len(t) > 1]
+    if not terms:
+        # An all-stopword query has no lexical signal; let the caller fall
+        # back to pure vector search rather than matching everything.
+        return ""
+    # Quote each term so embedded punctuation (2q17, s&p-style tokens) cannot
+    # re-enter the FTS grammar.
+    return " OR ".join(f'"{t}"' for t in terms)
 
 
 class VectorStore:
@@ -76,6 +104,22 @@ class VectorStore:
             )
             """
         )
+        # Keyword half of hybrid search. FTS5 ships with SQLite, so this costs
+        # no new dependency.
+        #
+        # Note this is a *regular* FTS5 table, not `content=''`. A contentless
+        # index stores only the postings, so its column values (including an
+        # UNINDEXED chunk_id) read back as NULL and there is no way to map a
+        # match to the chunk it came from. Duplicating the text is the price of
+        # being able to join the result back to chunk_meta.
+        cur.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(
+                chunk_id UNINDEXED,
+                text
+            )
+            """
+        )
         self.conn.commit()
 
     def add_chunks(self, records: list[dict[str, Any]]) -> int:
@@ -92,6 +136,7 @@ class VectorStore:
                 )
             cur.execute("DELETE FROM chunk_meta WHERE chunk_id = ?", (chunk_id,))
             cur.execute("DELETE FROM chunk_vec WHERE chunk_id = ?", (chunk_id,))
+            cur.execute("DELETE FROM chunk_fts WHERE chunk_id = ?", (chunk_id,))
             cur.execute(
                 "INSERT INTO chunk_meta(chunk_id, doc_id, entity, period, section, "
                 "chunk_idx, page_start, page_end, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -111,6 +156,10 @@ class VectorStore:
                 "INSERT INTO chunk_vec(chunk_id, embedding) VALUES (?, ?)",
                 (chunk_id, _vec_to_blob(embedding)),
             )
+            cur.execute(
+                "INSERT INTO chunk_fts(chunk_id, text) VALUES (?, ?)",
+                (chunk_id, rec["text"]),
+            )
             inserted += 1
         self.conn.commit()
         return inserted
@@ -124,6 +173,7 @@ class VectorStore:
         placeholders = ",".join("?" * len(ids))
         cur.execute(f"DELETE FROM chunk_meta WHERE chunk_id IN ({placeholders})", ids)
         cur.execute(f"DELETE FROM chunk_vec WHERE chunk_id IN ({placeholders})", ids)
+        cur.execute(f"DELETE FROM chunk_fts WHERE chunk_id IN ({placeholders})", ids)
         self.conn.commit()
         return len(ids)
 
@@ -205,6 +255,119 @@ class VectorStore:
                 }
             )
         return out
+
+    def _hydrate(self, scored: list[tuple[str, float]]) -> list[dict[str, Any]]:
+        """Turn (chunk_id, score) pairs into full chunk records, order preserved."""
+        cur = self.conn.cursor()
+        out: list[dict[str, Any]] = []
+        for chunk_id, score in scored:
+            cur.execute(
+                "SELECT doc_id, entity, period, section, chunk_idx, page_start, "
+                "page_end, text FROM chunk_meta WHERE chunk_id = ?",
+                (chunk_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                continue
+            out.append(
+                {
+                    "chunk_id": chunk_id,
+                    "doc_id": row[0],
+                    "entity": row[1],
+                    "period": row[2],
+                    "section": row[3],
+                    "chunk_idx": int(row[4]),
+                    "page_start": row[5],
+                    "page_end": row[6],
+                    "text": row[7],
+                    "score": float(score),
+                }
+            )
+        return out
+
+    def search_keyword(
+        self,
+        query: str,
+        k: int = 8,
+        filter_doc_id: Optional[str] = None,
+        filter_doc_ids: Optional[list[str]] = None,
+    ) -> list[dict[str, Any]]:
+        """BM25 keyword search over the FTS5 index.
+
+        This is the lexical half of hybrid retrieval. It catches what dense
+        embeddings systematically miss: exact tickers, fund names, dates, and
+        figures, where the literal token matters more than the surrounding
+        semantics.
+
+        ``score`` here is FTS5's bm25() output, which is *negative* with more
+        relevant results being more negative. Callers should treat it as an
+        ordering, not a magnitude, and never compare it against the cosine
+        distances returned by :meth:`search`. Fusing the two rankings is
+        exactly what :func:`lp_diligence.hybrid.reciprocal_rank_fusion` is for.
+        """
+        match_expr = _fts_match_expression(query)
+        if not match_expr:
+            return []
+
+        doc_set: Optional[set[str]] = None
+        if filter_doc_ids:
+            doc_set = {d for d in filter_doc_ids if d} or None
+        any_filter = bool(filter_doc_id or doc_set)
+
+        cur = self.conn.cursor()
+        # Over-fetch when filtering, since the filter is applied after ranking.
+        fetch_k = max(k * 8, 64) if any_filter else k
+        try:
+            cur.execute(
+                "SELECT chunk_id, bm25(chunk_fts) AS score FROM chunk_fts "
+                "WHERE chunk_fts MATCH ? ORDER BY score LIMIT ?",
+                (match_expr, fetch_k),
+            )
+            raw = cur.fetchall()
+        except sqlite3.OperationalError:
+            # Malformed FTS expression (unbalanced quotes, all stopwords, etc.)
+            # should degrade to "no keyword hits", not take out the query.
+            return []
+
+        scored: list[tuple[str, float]] = []
+        for chunk_id, score in raw:
+            if any_filter:
+                cur.execute("SELECT doc_id FROM chunk_meta WHERE chunk_id = ?", (chunk_id,))
+                row = cur.fetchone()
+                if not row:
+                    continue
+                doc_id = row[0]
+                if filter_doc_id and doc_id != filter_doc_id:
+                    continue
+                if doc_set is not None and doc_id not in doc_set:
+                    continue
+            scored.append((chunk_id, float(score)))
+            if len(scored) >= k:
+                break
+
+        return self._hydrate(scored)
+
+    def fts_count(self) -> int:
+        """Number of rows in the FTS index (0 means it needs backfilling)."""
+        cur = self.conn.cursor()
+        try:
+            cur.execute("SELECT COUNT(*) FROM chunk_fts")
+            return int(cur.fetchone()[0])
+        except sqlite3.OperationalError:
+            return 0
+
+    def backfill_fts(self) -> int:
+        """Populate the FTS index from chunk_meta for a store built before it existed.
+
+        Idempotent: clears the index first, so re-running cannot double-index.
+        """
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM chunk_fts")
+        cur.execute("SELECT chunk_id, text FROM chunk_meta")
+        rows = cur.fetchall()
+        cur.executemany("INSERT INTO chunk_fts(chunk_id, text) VALUES (?, ?)", rows)
+        self.conn.commit()
+        return len(rows)
 
     def close(self) -> None:
         try:

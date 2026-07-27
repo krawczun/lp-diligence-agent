@@ -57,6 +57,18 @@ RERANK_CANDIDATES: int = int(os.environ.get("LP_DILIGENCE_RERANK_CANDIDATES", "2
 RERANK_MAX_LENGTH: int = int(os.environ.get("LP_DILIGENCE_RERANK_MAX_LENGTH", "256"))
 RERANK_BATCH_SIZE: int = int(os.environ.get("LP_DILIGENCE_RERANK_BATCH_SIZE", "16"))
 
+# Hybrid search
+# Fuse dense vector search with BM25 keyword search over the FTS5 index.
+# Off by default so the eval can A/B it: LP_DILIGENCE_HYBRID=1 turns it on.
+HYBRID_ENABLED: bool = os.environ.get("LP_DILIGENCE_HYBRID", "").strip().lower() in {"1", "true", "yes", "on"}
+# Candidates pulled from each retriever before fusion.
+HYBRID_CANDIDATES: int = int(os.environ.get("LP_DILIGENCE_HYBRID_CANDIDATES", "25"))
+# RRF damping constant; see lp_diligence.hybrid for what it controls.
+HYBRID_RRF_K: int = int(os.environ.get("LP_DILIGENCE_HYBRID_RRF_K", "60"))
+# Relative weight of the two retrievers at fusion time (dense, sparse).
+HYBRID_DENSE_WEIGHT: float = float(os.environ.get("LP_DILIGENCE_HYBRID_DENSE_WEIGHT", "1.0"))
+HYBRID_SPARSE_WEIGHT: float = float(os.environ.get("LP_DILIGENCE_HYBRID_SPARSE_WEIGHT", "1.0"))
+
 
 def ensure_cache_dir() -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)

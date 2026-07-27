@@ -61,6 +61,12 @@ def main() -> int:
     ap.add_argument("--model", type=str, default=None, help="Override the cross-encoder model.")
     ap.add_argument("--max-length", type=int, default=None, help="Override RERANK_MAX_LENGTH.")
     ap.add_argument("--limit", type=int, default=None, help="Only run the first N questions.")
+    ap.add_argument(
+        "--mode",
+        choices=("rerank", "hybrid", "both"),
+        default="rerank",
+        help="Which stage to A/B against the plain vector baseline.",
+    )
     args = ap.parse_args()
 
     # Config is read at import time, so set overrides before importing.
@@ -80,21 +86,37 @@ def main() -> int:
     embedder = embeddings.Embedder()
     store = vectorstore.VectorStore(config.VECTOR_DB_PATH, dim=embedder.dim)
 
-    if not reranking.is_available():
+    want_rerank = args.mode in ("rerank", "both")
+    want_hybrid = args.mode in ("hybrid", "both")
+
+    if want_rerank and not reranking.is_available():
         store.close()
         raise SystemExit(
             "cross-encoder unavailable. Install with: pip install -e 'backend[embeddings]'"
         )
 
-    # Warm both paths so the timings below exclude one-off model load.
-    retrieval.retrieve(questions[0], embedder=embedder, store=store, rerank=False)
-    retrieval.retrieve(questions[0], embedder=embedder, store=store, rerank=True)
+    if want_hybrid and store.fts_count() == 0:
+        print(f"FTS index empty; backfilling {store.count()} chunks...")
+        store.backfill_fts()
 
-    print(
-        f"corpus={config.VECTOR_DB_PATH.name}  k={config.RETRIEVAL_K}  "
-        f"candidates={config.RERANK_CANDIDATES}  "
-        f"model={config.RERANK_MODEL.split('/')[-1]}  max_len={config.RERANK_MAX_LENGTH}"
+    # Warm both paths so the timings below exclude one-off model load.
+    retrieval.retrieve(questions[0], embedder=embedder, store=store, rerank=False, hybrid=False)
+    retrieval.retrieve(
+        questions[0], embedder=embedder, store=store, rerank=want_rerank, hybrid=want_hybrid
     )
+
+    print(f"corpus={config.VECTOR_DB_PATH.name}  k={config.RETRIEVAL_K}  mode={args.mode}")
+    if want_hybrid:
+        print(
+            f"  hybrid:  candidates={config.HYBRID_CANDIDATES}  rrf_k={config.HYBRID_RRF_K}  "
+            f"weights=({config.HYBRID_DENSE_WEIGHT}, {config.HYBRID_SPARSE_WEIGHT})  "
+            f"fts_rows={store.fts_count()}"
+        )
+    if want_rerank:
+        print(
+            f"  rerank:  candidates={config.RERANK_CANDIDATES}  "
+            f"model={config.RERANK_MODEL.split('/')[-1]}  max_len={config.RERANK_MAX_LENGTH}"
+        )
     print(f"questions={len(questions)}\n")
     print(f"{'#':>3}  {'churn':>5}  {'promoted':>8}  {'deep':>4}  {'base ms':>7}  {'rr ms':>6}")
     print("-" * 46)
@@ -107,15 +129,20 @@ def main() -> int:
 
     for i, q in enumerate(questions, 1):
         t = time.perf_counter()
-        base = retrieval.retrieve(q, embedder=embedder, store=store, rerank=False)
+        base = retrieval.retrieve(q, embedder=embedder, store=store, rerank=False, hybrid=False)
         b_ms = (time.perf_counter() - t) * 1000
 
         t = time.perf_counter()
-        rr = retrieval.retrieve(q, embedder=embedder, store=store, rerank=True)
+        rr = retrieval.retrieve(
+            q, embedder=embedder, store=store, rerank=want_rerank, hybrid=want_hybrid
+        )
         r_ms = (time.perf_counter() - t) * 1000
 
         base_ids = {c.chunk_id for c in base}
         churn = sum(1 for c in rr if c.chunk_id not in base_ids)
+        # vector_rank is only annotated by the reranker, so "promoted" and
+        # "deep" are reranking diagnostics; in hybrid-only mode churn is the
+        # meaningful column.
         promoted = sum(1 for c in rr if c.vector_rank is not None and c.vector_rank >= len(base))
         deep = max((c.vector_rank or 0) for c in rr) if rr else 0
 
