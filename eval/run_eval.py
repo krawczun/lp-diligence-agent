@@ -178,6 +178,9 @@ def run_eval(sample: Optional[int] = None) -> dict:
     n = len(rows)
     summary = {
         "n_questions": n,
+        "rerank_enabled": config.RERANK_ENABLED,
+        "rerank_model": config.RERANK_MODEL if config.RERANK_ENABLED else None,
+        "rerank_candidates": config.RERANK_CANDIDATES if config.RERANK_ENABLED else None,
         "refusal_correctness": sum(1 for r in rows if r.refusal_correct) / max(1, n),
         "keyword_match": sum(1 for r in rows if r.keyword_match) / max(1, n),
         "faithfulness_mean": sum(r.faithfulness for r in rows) / max(1, n),
@@ -209,6 +212,12 @@ def _render_markdown(summary: dict, rows: list[EvalRow]) -> str:
         "",
         f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}",
         f"Model: `{config.MODEL}` (judge: `{config.JUDGE_MODEL}`)",
+        (
+            f"Reranking: **on** (`{summary['rerank_model']}`, "
+            f"{summary['rerank_candidates']} candidates -> top {config.RETRIEVAL_K})"
+            if summary.get("rerank_enabled")
+            else "Reranking: **off** (vector similarity only)"
+        ),
         "",
         "## Summary",
         "",
@@ -239,7 +248,36 @@ def _render_markdown(summary: dict, rows: list[EvalRow]) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sample", type=int, default=None, help="Run only the first N questions (smoke test).")
+    rerank_group = parser.add_mutually_exclusive_group()
+    rerank_group.add_argument(
+        "--rerank",
+        dest="rerank",
+        action="store_true",
+        default=None,
+        help="Force cross-encoder reranking ON for this run.",
+    )
+    rerank_group.add_argument(
+        "--no-rerank",
+        dest="rerank",
+        action="store_false",
+        help="Force cross-encoder reranking OFF for this run (the A/B baseline).",
+    )
     args = parser.parse_args()
+
+    # Retrieval reads config at call time, so setting it here covers every
+    # question in the run without threading a flag through the call chain.
+    if args.rerank is not None:
+        config.RERANK_ENABLED = args.rerank
+
+    state = "ON" if config.RERANK_ENABLED else "OFF"
+    detail = ""
+    if config.RERANK_ENABLED:
+        detail = (
+            f" (model={config.RERANK_MODEL.split('/')[-1]}, "
+            f"candidates={config.RERANK_CANDIDATES}, max_len={config.RERANK_MAX_LENGTH})"
+        )
+    print(f"Reranking: {state}{detail}\n")
+
     run_eval(sample=args.sample)
     return 0
 

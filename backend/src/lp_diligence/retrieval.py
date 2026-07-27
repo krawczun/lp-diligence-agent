@@ -21,6 +21,12 @@ class Citation:
     page_end: int | None
     excerpt: str
     score: float
+    # Set only when reranking ran. ``rerank_score`` is the cross-encoder logit
+    # for this (query, chunk) pair; ``vector_rank`` is where the chunk sat in
+    # the bi-encoder ordering beforehand, which is what makes the movement
+    # measurable.
+    rerank_score: float | None = None
+    vector_rank: int | None = None
 
     def label(self) -> str:
         """Short citation label like ``[PSERS 2Q17 Performance p.12]``."""
@@ -41,12 +47,18 @@ def retrieve(
     k: Optional[int] = None,
     embedder: Optional[Embedder] = None,
     store: Optional[VectorStore] = None,
+    rerank: Optional[bool] = None,
 ) -> list[Citation]:
     """Vector-search the corpus and return citations.
 
     If ``embedder``/``store`` are not provided, a default pair is constructed
     using ``config``. Callers running many queries should pass shared instances
     to avoid model-reload cost.
+
+    When reranking is on (``rerank``, defaulting to ``config.RERANK_ENABLED``),
+    the vector search is widened to ``config.RERANK_CANDIDATES`` and a local
+    cross-encoder re-scores those candidates down to the requested ``k``. See
+    :mod:`lp_diligence.reranking` for why that ordering matters.
     """
     embedder = embedder or Embedder()
     own_store = False
@@ -60,15 +72,28 @@ def retrieve(
             store.close()
         return []
 
+    top_k = k or config.RETRIEVAL_K
+    use_rerank = config.RERANK_ENABLED if rerank is None else rerank
+
+    # With reranking on, pull a wider candidate set so the cross-encoder has
+    # something to actually choose from; the bi-encoder's job becomes recall,
+    # and precision is the reranker's problem.
+    search_k = max(top_k, config.RERANK_CANDIDATES) if use_rerank else top_k
+
     hits = store.search(
         qvec,
-        k=k or config.RETRIEVAL_K,
+        k=search_k,
         filter_doc_id=doc_id,
         filter_doc_ids=doc_ids,
     )
 
     if own_store:
         store.close()
+
+    if use_rerank:
+        from .reranking import rerank as _rerank
+
+        hits = _rerank(query, hits, top_k=top_k)
 
     citations: list[Citation] = []
     for h in hits:
@@ -83,6 +108,8 @@ def retrieve(
                 page_end=h.get("page_end"),
                 excerpt=h["text"],
                 score=h["score"],
+                rerank_score=h.get("rerank_score"),
+                vector_rank=h.get("vector_rank"),
             )
         )
     return citations

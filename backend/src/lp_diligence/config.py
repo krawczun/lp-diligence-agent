@@ -41,6 +41,22 @@ TARGET_TOKENS: int = 500
 OVERLAP_TOKENS: int = 60
 RETRIEVAL_K: int = 8
 
+# Reranking
+# Retrieve a wide candidate set with the cheap bi-encoder, then let a local
+# cross-encoder re-score those candidates and keep the best RETRIEVAL_K.
+# Off by default so the eval can A/B it: LP_DILIGENCE_RERANK=1 turns it on.
+RERANK_ENABLED: bool = os.environ.get("LP_DILIGENCE_RERANK", "").strip().lower() in {"1", "true", "yes", "on"}
+RERANK_MODEL: str = os.environ.get(
+    "LP_DILIGENCE_RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"
+)
+RERANK_CANDIDATES: int = int(os.environ.get("LP_DILIGENCE_RERANK_CANDIDATES", "25"))
+# Cross-encoder cost is roughly linear in candidates and in sequence length.
+# On CPU the 512-token window is the dominant term, and chunks here target
+# ~500 tokens, so truncating to 256 buys most of the speedup at little cost
+# in ranking quality: the signal that matters is usually early in the chunk.
+RERANK_MAX_LENGTH: int = int(os.environ.get("LP_DILIGENCE_RERANK_MAX_LENGTH", "256"))
+RERANK_BATCH_SIZE: int = int(os.environ.get("LP_DILIGENCE_RERANK_BATCH_SIZE", "16"))
+
 
 def ensure_cache_dir() -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
