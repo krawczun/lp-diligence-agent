@@ -42,24 +42,81 @@ backend/src/lp_diligence/
   documents.py     # PDF + HTML loaders + section detection
   chunking.py      # deterministic sentence-aware chunker
   embeddings.py    # local sentence-transformers (default) or OpenAI
-  vectorstore.py   # sqlite-vec wrapper for cosine similarity
+  vectorstore.py   # sqlite-vec cosine similarity + FTS5 BM25 keyword search
+  hybrid.py        # reciprocal rank fusion of the dense and sparse rankings
+  reranking.py     # optional cross-encoder reranking stage
   ingest.py        # load → chunk → embed → store pipeline
-  retrieval.py     # query → top-k chunks + citation formatting
+  retrieval.py     # query → retrieve → fuse → (rerank) → cited chunks
   checklist.py     # the 9 items + the agent that fills them in
   api.py           # FastAPI server backing the Next.js demo
   mcp_server.py    # MCP server for Claude Desktop
   cli.py           # `lp-diligence` command-line interface
 
 eval/
-  golden_set/      # 20-question hand-curated set
-  run_eval.py      # judge LLM scores faithfulness / recall / precision
-  reports/         # eval output (generated)
+  golden_set/         # 20-question hand-curated set
+  run_eval.py         # judge LLM scores faithfulness / recall / precision
+  compare_rerank.py   # retrieval-only A/B (runs offline, no API key)
+  published/          # committed baselines
+  reports/            # eval output (generated)
 
 docs/
   solution-design.md  # 1-page solution memo
   architecture.md     # diagrams + decisions
 
 frontend/          # Next.js demo UI (see frontend/README.md)
+```
+
+## Retrieval: hybrid search, and why reranking is off
+
+Retrieval runs in up to three stages: dense vector search, optional fusion with BM25 keyword search, and an optional cross-encoder reranking pass. Each stage is independently switchable so any combination can be measured.
+
+**Hybrid search is on by default. Cross-encoder reranking is off.** That second decision was measured, not assumed.
+
+### Why hybrid
+
+Dense embedding search understands meaning but smears exact tokens. A query naming `2Q17` ranks chunks from 3Q17 and 4Q17 nearly as highly, because the period code dissolves into the surrounding semantics. BM25 has the mirror failure: it nails the literal token and has no idea "returns" and "performance" are related. Fusing them covers both.
+
+The two score scales are not comparable (cosine distance versus `bm25()`, different ranges, different signs), so any weighted sum of raw scores would be arbitrary. [Reciprocal rank fusion](backend/src/lp_diligence/hybrid.py) discards magnitudes and uses only rank position, which is comparable across retrievers and rewards cross-retriever agreement.
+
+### The measurement
+
+All four configurations, run end to end over the 20-question golden set with an LLM judge:
+
+| Config | Faithfulness | Context recall | Context precision | Refusal correctness |
+|---|---|---|---|---|
+| Vector only | 0.84 | 0.61 | 0.59 | 0.75 |
+| Rerank only | 0.89 | 0.69 | 0.68 | 0.70 |
+| **Hybrid only** | **0.91** | **0.73** | **0.71** | **0.80** |
+| Hybrid + rerank | 0.89 | 0.61 | 0.65 | 0.75 |
+
+Retrieval-level cost, measured separately (baseline vector search is ~25 ms/query):
+
+| Config | Top-8 chunks replaced | Added latency |
+|---|---|---|
+| Hybrid only | 46% | **+6 ms** |
+| Rerank only | 51% | +2038 ms |
+| Hybrid + rerank | 67% | +3799 ms |
+
+### Three findings
+
+**Hybrid won on every quality metric and cost 6 ms.** Reranking spent 2 seconds per query to finish second.
+
+**Stacking both was worse than hybrid alone.** Context recall fell from 0.73 to 0.61. The likely mechanism: RRF ranks by cross-retriever agreement, and re-scoring the fused set on pairwise relevance discards exactly that signal. Two rankers optimizing different objectives in sequence can undo each other.
+
+**Reranking alone lowered refusal correctness below baseline** (0.70 versus 0.75), the only metric where it lost outright. On a corpus where refusing unsupported questions is a safety property, surfacing more plausible-looking context can make the model less willing to refuse. That is a quality regression, not just a latency cost.
+
+Reranking stays in the codebase, documented and one flag away. It is the right tool when recall is good and ordering is bad, and a GPU changes the latency arithmetic entirely. It is simply not the right default *here*.
+
+### Caveats
+
+One corpus, one embedding model (`all-MiniLM-L6-v2`, 384 dims), 20 questions, single run per configuration, CPU-only inference. The direction is consistent across metrics and the effect sizes are larger than the gaps between adjacent configurations, but this is not a claim about hybrid search in general. It is a claim about this corpus.
+
+Reproduce with:
+
+```powershell
+python eval\compare_rerank.py --mode hybrid    # retrieval-only, no API key needed
+python eval\run_eval.py --no-rerank            # end-to-end, needs ANTHROPIC_API_KEY
+$env:LP_DILIGENCE_HYBRID=1; python eval\run_eval.py --no-rerank
 ```
 
 ## Guardrails
@@ -100,14 +157,22 @@ For Claude Desktop MCP integration, see `docs/mcp-setup.md`. For running the ful
 
 ## Eval results
 
-The committed baseline is at [eval/published/baseline.md](eval/published/baseline.md). Numbers published verbatim regardless of whether they're flattering. Headline metrics from the baseline:
+Numbers are published verbatim regardless of whether they're flattering. Committed baselines:
 
-- Faithfulness: 0.78 mean across the 20-question golden set
-- Refusal correctness: 0.80 (16/20 refusal decisions matched expectations)
-- Context recall: 0.62, context precision: 0.60
-- Average latency: 4.2s per checklist item
+- [`eval/published/baseline_hybrid.json`](eval/published/baseline_hybrid.json): the current default configuration
+- [`eval/published/baseline_vector_only.json`](eval/published/baseline_vector_only.json): dense retrieval alone, for comparison
+- [`eval/published/baseline.md`](eval/published/baseline.md): the original pre-hybrid run
 
-Local eval runs land in `eval/reports/` (gitignored). Next iteration would add chunk re-ranking and per-section query rewriting to lift retrieval precision.
+Headline metrics on the current default (hybrid search, 20-question golden set):
+
+- Faithfulness: 0.91 mean
+- Refusal correctness: 0.80
+- Context recall: 0.73, context precision: 0.71
+- Average latency: 5.0s per checklist item
+
+The full four-way comparison and the reasoning behind the default configuration are in [Retrieval](#retrieval-hybrid-search-and-why-reranking-is-off) above.
+
+Local eval runs land in `eval/reports/` (gitignored). Next iteration would add per-section query rewriting, and would test whether reranking earns its place on a GPU where the latency cost largely disappears.
 
 ## License
 
