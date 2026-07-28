@@ -44,7 +44,18 @@ RETRIEVAL_K: int = 8
 # Reranking
 # Retrieve a wide candidate set with the cheap bi-encoder, then let a local
 # cross-encoder re-score those candidates and keep the best RETRIEVAL_K.
-# Off by default so the eval can A/B it: LP_DILIGENCE_RERANK=1 turns it on.
+#
+# OFF by default, and that is a measured decision rather than an oversight.
+# Over the 20-question golden set (2026-07-28) reranking did beat the plain
+# vector baseline, but it lost to hybrid search on every quality metric while
+# costing ~2 s per query instead of ~6 ms. Stacking it on top of hybrid was
+# worse than hybrid alone (context recall 0.61 vs 0.73): RRF ranks by
+# cross-retriever agreement, and re-scoring the fused set on pairwise
+# relevance discards exactly that signal.
+#
+# Kept in the codebase because it is the right tool for a corpus where
+# recall is good and ordering is bad, and because the GPU path changes the
+# latency calculus entirely. LP_DILIGENCE_RERANK=1 turns it on.
 RERANK_ENABLED: bool = os.environ.get("LP_DILIGENCE_RERANK", "").strip().lower() in {"1", "true", "yes", "on"}
 RERANK_MODEL: str = os.environ.get(
     "LP_DILIGENCE_RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -59,8 +70,12 @@ RERANK_BATCH_SIZE: int = int(os.environ.get("LP_DILIGENCE_RERANK_BATCH_SIZE", "1
 
 # Hybrid search
 # Fuse dense vector search with BM25 keyword search over the FTS5 index.
-# Off by default so the eval can A/B it: LP_DILIGENCE_HYBRID=1 turns it on.
-HYBRID_ENABLED: bool = os.environ.get("LP_DILIGENCE_HYBRID", "").strip().lower() in {"1", "true", "yes", "on"}
+#
+# ON by default. Measured 2026-07-28 over the 20-question golden set, hybrid
+# was the best configuration on every quality metric (faithfulness 0.91 vs
+# 0.84 baseline, context precision 0.71 vs 0.59, refusal correctness 0.80 vs
+# 0.75) at a cost of ~6 ms per query. Set LP_DILIGENCE_HYBRID=0 to disable.
+HYBRID_ENABLED: bool = os.environ.get("LP_DILIGENCE_HYBRID", "1").strip().lower() in {"1", "true", "yes", "on"}
 # Candidates pulled from each retriever before fusion.
 HYBRID_CANDIDATES: int = int(os.environ.get("LP_DILIGENCE_HYBRID_CANDIDATES", "25"))
 # RRF damping constant; see lp_diligence.hybrid for what it controls.
