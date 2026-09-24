@@ -113,7 +113,27 @@ async def lifespan(app: FastAPI):
     logger.info("Embedder ready in %.1fs", time.time() - t0)
     _anthropic_client = _build_client()
     logger.info("Anthropic client ready")
+    _ensure_keyword_index(_embedder.dim)
     yield
+
+
+def _ensure_keyword_index(dim: int) -> None:
+    """Build the BM25 index if the store predates hybrid search.
+
+    A store ingested before hybrid retrieval existed has chunks but an empty
+    FTS table. Hybrid search then silently degrades to dense-only, so fix it
+    here rather than relying on someone remembering a manual backfill.
+    """
+    if not config.HYBRID_ENABLED:
+        return
+    store = VectorStore(config.VECTOR_DB_PATH, dim=dim)
+    try:
+        chunks = store.count()
+        if chunks and store.fts_count() == 0:
+            indexed = store.backfill_fts()
+            logger.info("Keyword index was empty; backfilled %d chunks", indexed)
+    finally:
+        store.close()
 
 
 def get_embedder() -> Embedder:

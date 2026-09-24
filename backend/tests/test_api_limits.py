@@ -95,3 +95,44 @@ class TestRateLimit:
             api._check_rate_limit("a")
         api._check_rate_limit("b")
         assert len(api._global_bucket) == 2
+
+
+class TestKeywordIndexBackfill:
+    """Startup repairs a store that predates hybrid search."""
+
+    @staticmethod
+    def _store(path):
+        from lp_diligence.vectorstore import VectorStore
+        return VectorStore(path, dim=4)
+
+    def _seed_without_fts(self, path):
+        store = self._store(path)
+        store.add_chunks([{
+            "chunk_id": "c1", "doc_id": "d", "entity": "e", "period": "p",
+            "section": "s", "chunk_idx": 0, "page_start": 1, "page_end": 1,
+            "text": "management fee of 1.25 percent", "embedding": [0.1, 0.2, 0.3, 0.4],
+        }])
+        store.conn.execute("DELETE FROM chunk_fts")
+        store.conn.commit()
+        assert store.fts_count() == 0
+        store.close()
+
+    def test_empty_index_is_backfilled(self, tmp_path, monkeypatch):
+        db = tmp_path / "v.sqlite"
+        self._seed_without_fts(db)
+        monkeypatch.setattr(api.config, "VECTOR_DB_PATH", db)
+        monkeypatch.setattr(api.config, "HYBRID_ENABLED", True)
+        api._ensure_keyword_index(4)
+        store = self._store(db)
+        assert store.fts_count() == 1
+        store.close()
+
+    def test_skipped_when_hybrid_disabled(self, tmp_path, monkeypatch):
+        db = tmp_path / "v.sqlite"
+        self._seed_without_fts(db)
+        monkeypatch.setattr(api.config, "VECTOR_DB_PATH", db)
+        monkeypatch.setattr(api.config, "HYBRID_ENABLED", False)
+        api._ensure_keyword_index(4)
+        store = self._store(db)
+        assert store.fts_count() == 0
+        store.close()
