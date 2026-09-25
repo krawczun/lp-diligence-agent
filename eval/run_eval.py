@@ -31,6 +31,7 @@ import anthropic  # noqa: E402
 from lp_diligence import config  # noqa: E402
 from lp_diligence.checklist import _build_client, answer_item  # noqa: E402
 from lp_diligence.embeddings import Embedder  # noqa: E402
+from lp_diligence.retrieval import Citation, format_context  # noqa: E402
 from lp_diligence.vectorstore import VectorStore  # noqa: E402
 
 
@@ -102,23 +103,50 @@ def _load_golden(path: Path, sample: Optional[int]) -> list[EvalRow]:
     return rows
 
 
-def _judge(client: anthropic.Anthropic, question: str, context: str, answer: str) -> dict:
-    prompt = JUDGE_PROMPT.format(question=question, context=context[:6000], answer=answer)
-    resp = client.messages.create(
-        model=config.JUDGE_MODEL,
-        max_tokens=300,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = "".join(b.text for b in resp.content if b.type == "text").strip()
+def _judge_context(citations: list[dict]) -> str:
+    """The exact context block the agent saw, rebuilt from the answer's citations.
+
+    The judge must see everything the agent saw. An earlier version passed only the
+    first 6 excerpts, cut to 6,000 characters, so detailed answers that drew on later
+    excerpts were scored "unsupported" for facts the judge never received.
+    """
+    return format_context([Citation(**c) for c in citations])
+
+
+def _parse_judge(raw: str) -> dict:
+    raw = raw.strip()
     if raw.startswith("```"):
         raw = raw.strip("`")
         if raw.lower().startswith("json"):
             raw = raw[4:].strip()
     try:
-        data = json.loads(raw)
+        return json.loads(raw)
     except json.JSONDecodeError:
-        return {"faithfulness": 0.0, "context_recall": 0.0, "context_precision": 0.0, "rationale": "judge JSON parse failed"}
-    return data
+        pass
+    # The judge sometimes wraps the object in prose; take the outermost {...} block.
+    start, end = raw.find("{"), raw.rfind("}")
+    if start != -1 and end > start:
+        try:
+            return json.loads(raw[start:end + 1])
+        except json.JSONDecodeError:
+            pass
+    return {"faithfulness": 0.0, "context_recall": 0.0, "context_precision": 0.0,
+            "rationale": "judge JSON parse failed", "parse_failed": True}
+
+
+def _judge(client: anthropic.Anthropic, question: str, context: str, answer: str) -> dict:
+    prompt = JUDGE_PROMPT.format(question=question, context=context, answer=answer)
+    kwargs = {}
+    # Newer models think by default; a judge that returns one JSON object doesn't need to.
+    if config.JUDGE_MODEL.startswith(("claude-sonnet-5", "claude-opus-5")):
+        kwargs["thinking"] = {"type": "disabled"}
+    resp = client.messages.create(
+        model=config.JUDGE_MODEL,
+        max_tokens=1000,
+        messages=[{"role": "user", "content": prompt}],
+        **kwargs,
+    )
+    return _parse_judge("".join(b.text for b in resp.content if b.type == "text"))
 
 
 def _keyword_match(answer: str, keywords: list[str]) -> bool:
@@ -158,8 +186,7 @@ def run_eval(sample: Optional[int] = None) -> dict:
 
         # Judge — but skip when expected refusal and agent refused (no answer to score)
         if not (row.expected_refusal and is_refusal):
-            context = "\n---\n".join(c["excerpt"] for c in ans.citations[:6])
-            scores = _judge(client, row.question, context, ans.answer)
+            scores = _judge(client, row.question, _judge_context(ans.citations), ans.answer)
             row.faithfulness = float(scores.get("faithfulness", 0.0))
             row.context_recall = float(scores.get("context_recall", 0.0))
             row.context_precision = float(scores.get("context_precision", 0.0))

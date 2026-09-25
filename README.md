@@ -70,7 +70,7 @@ frontend/          # Next.js demo UI (see frontend/README.md)
 
 Retrieval runs in up to three stages: dense vector search, optional fusion with BM25 keyword search, and an optional cross-encoder reranking pass. Each stage is independently switchable so any combination can be measured.
 
-**Hybrid search is on by default. Cross-encoder reranking is off.** That second decision was measured, not assumed.
+**Hybrid search is on by default. Cross-encoder reranking is off.** Both decisions were measured, and the measurement was later corrected (see below).
 
 ### Why hybrid
 
@@ -80,14 +80,14 @@ The two score scales are not comparable (cosine distance versus `bm25()`, differ
 
 ### The measurement
 
-All four configurations, run end to end over the 20-question golden set with an LLM judge:
+All four configurations, run end to end over the 20-question golden set. Faithfulness, context recall and context precision are scored by an LLM judge (Claude Sonnet 5) that sees exactly the excerpts the agent saw; refusal correctness and keyword match are mechanical checks.
 
-| Config | Faithfulness | Context recall | Context precision | Refusal correctness |
-|---|---|---|---|---|
-| Vector only | 0.84 | 0.61 | 0.59 | 0.75 |
-| Rerank only | 0.89 | 0.69 | 0.68 | 0.70 |
-| **Hybrid only** | **0.91** | **0.73** | **0.71** | **0.80** |
-| Hybrid + rerank | 0.89 | 0.61 | 0.65 | 0.75 |
+| Config | Faithfulness | Context recall | Context precision | Refusal correctness | Keyword match |
+|---|---|---|---|---|---|
+| Vector only | 0.95 | 0.77 | 0.50 | 0.75 | 0.75 |
+| Rerank only | 0.95 | 0.75 | 0.53 | 0.70 | 0.70 |
+| **Hybrid only** | **0.96** | **0.75** | **0.53** | **0.80** | **0.85** |
+| Hybrid + rerank | 0.94 | 0.74 | 0.51 | 0.75 | 0.80 |
 
 Retrieval-level cost, measured separately (baseline vector search is ~25 ms/query):
 
@@ -97,19 +97,23 @@ Retrieval-level cost, measured separately (baseline vector search is ~25 ms/quer
 | Rerank only | 51% | +2038 ms |
 | Hybrid + rerank | 67% | +3799 ms |
 
-### Three findings
+### What the corrected numbers support
 
-**Hybrid won on every quality metric and cost 6 ms.** Reranking spent 2 seconds per query to finish second.
+**On judged quality, the four configurations are indistinguishable.** Every gap in faithfulness, recall and precision is 0.03 or less on 20 questions, which is noise. Hybrid leads on the two mechanical checks (refusal correctness and keyword match), but by one or two questions, which is also within noise.
 
-**Stacking both was worse than hybrid alone.** Context recall fell from 0.73 to 0.61. The likely mechanism: RRF ranks by cross-retriever agreement, and re-scoring the fused set on pairwise relevance discards exactly that signal. Two rankers optimizing different objectives in sequence can undo each other.
+**So the decision rests on cost.** Hybrid costs 6 ms a query and is at least as good as anything else measured, so it stays on. Reranking costs about 2 seconds a query and bought nothing measurable, so it stays off. It remains in the codebase, one flag away: it is the right tool when recall is good and ordering is bad, and a GPU changes the latency arithmetic entirely.
 
-**Reranking alone lowered refusal correctness below baseline** (0.70 versus 0.75), the only metric where it lost outright. On a corpus where refusing unsupported questions is a safety property, surfacing more plausible-looking context can make the model less willing to refuse. That is a quality regression, not just a latency cost.
+**About half of every retrieved set is irrelevant.** Context precision sits near 0.5 in every configuration. That, not the ranking method, is where retrieval quality is lost, and it is the next thing to fix.
 
-Reranking stays in the codebase, documented and one flag away. It is the right tool when recall is good and ordering is bad, and a GPU changes the latency arithmetic entirely. It is simply not the right default *here*.
+### Correction, 2026-09-25
+
+The first version of this section reported that hybrid "won on every quality metric" and that stacking reranking on hybrid cut context recall from 0.73 to 0.61. Both claims were artifacts of the judge. It was Claude Haiku, shown only the first 6 of the 8 excerpts the agent saw and cut to 6,000 characters, so answers that drew on later excerpts were marked unsupported and the missing excerpts could not count toward recall or precision.
+
+The judge now receives the full context the agent saw, runs on Sonnet 5, and was checked against planted errors before use (answers with falsified figures scored 0.2 instead of 1.0). All five stored runs were re-graded without regenerating any answers; the originals are unchanged in `eval/reports/` and the re-graded versions, with the first judge's scores kept alongside, are in [`eval/published/regraded/`](eval/published/regraded/). The fix is in [`eval/run_eval.py`](eval/run_eval.py), and [`eval/regrade_reports.py`](eval/regrade_reports.py) reproduces the re-grade.
 
 ### Caveats
 
-One corpus, one embedding model (`all-MiniLM-L6-v2`, 384 dims), 20 questions, single run per configuration, CPU-only inference. The direction is consistent across metrics and the effect sizes are larger than the gaps between adjacent configurations, but this is not a claim about hybrid search in general. It is a claim about this corpus.
+One corpus, one embedding model (`all-MiniLM-L6-v2`, 384 dims), 20 questions, single run per configuration, CPU-only inference, and an LLM judge that makes its own mistakes. At this sample size only large differences are real. This is not a claim about hybrid search in general. It is a claim about this corpus.
 
 Reproduce with:
 
@@ -162,17 +166,18 @@ Numbers are published verbatim regardless of whether they're flattering. Committ
 - [`eval/published/baseline_hybrid.json`](eval/published/baseline_hybrid.json): the current default configuration
 - [`eval/published/baseline_vector_only.json`](eval/published/baseline_vector_only.json): dense retrieval alone, for comparison
 - [`eval/published/baseline.md`](eval/published/baseline.md): the original pre-hybrid run
+- [`eval/published/regraded/`](eval/published/regraded/): all five runs re-scored by the corrected judge (see [Correction](#correction-2026-09-25))
 
-Headline metrics on the current default (hybrid search, 20-question golden set):
+Headline metrics on the current default (hybrid search, 20-question golden set, corrected judge):
 
-- Faithfulness: 0.91 mean
+- Faithfulness: 0.96 mean
 - Refusal correctness: 0.80
-- Context recall: 0.73, context precision: 0.71
+- Context recall: 0.75, context precision: 0.53
 - Average latency: 5.0s per checklist item
 
 The full four-way comparison and the reasoning behind the default configuration are in [Retrieval](#retrieval-hybrid-search-and-why-reranking-is-off) above.
 
-Local eval runs land in `eval/reports/` (gitignored). Next iteration would add per-section query rewriting, and would test whether reranking earns its place on a GPU where the latency cost largely disappears.
+Local eval runs land in `eval/reports/` (gitignored). Next iteration would target retrieval precision (about half of retrieved excerpts are irrelevant), likely through per-section query rewriting, and would test whether reranking earns its place on a GPU where the latency cost largely disappears.
 
 ## License
 

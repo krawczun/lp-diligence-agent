@@ -24,7 +24,8 @@ load_dotenv(_REPO_ROOT / ".env", override=False)
 ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
 
 MODEL: str = os.environ.get("LP_DILIGENCE_MODEL", "claude-sonnet-4-6")
-JUDGE_MODEL: str = os.environ.get("LP_DILIGENCE_JUDGE_MODEL", "claude-haiku-4-5-20251001")
+# Sonnet 5 since 2026-09-25: the judge should be at least as capable as the answers it grades.
+JUDGE_MODEL: str = os.environ.get("LP_DILIGENCE_JUDGE_MODEL", "claude-sonnet-5")
 
 EMBEDDING_PROVIDER: str = os.environ.get("LP_DILIGENCE_EMBEDDING_PROVIDER", "local")
 LOCAL_EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
@@ -46,12 +47,13 @@ RETRIEVAL_K: int = 8
 # cross-encoder re-score those candidates and keep the best RETRIEVAL_K.
 #
 # OFF by default, and that is a measured decision rather than an oversight.
-# Over the 20-question golden set (2026-07-28) reranking did beat the plain
-# vector baseline, but it lost to hybrid search on every quality metric while
-# costing ~2 s per query instead of ~6 ms. Stacking it on top of hybrid was
-# worse than hybrid alone (context recall 0.61 vs 0.73): RRF ranks by
-# cross-retriever agreement, and re-scoring the fused set on pairwise
-# relevance discards exactly that signal.
+# Over the 20-question golden set (run 2026-07-28, re-graded 2026-09-25 with a
+# judge that sees the full context), reranking bought no measurable quality:
+# faithfulness, recall and precision all land within 0.03 of hybrid and of
+# plain vector search. It costs ~2 s per query against ~6 ms for hybrid, so
+# on this corpus it doesn't earn its latency. (An earlier note here claimed
+# stacking it on hybrid cut recall from 0.73 to 0.61; that was an artifact of
+# a judge that saw only part of the context. See README, "Correction".)
 #
 # Kept in the codebase because it is the right tool for a corpus where
 # recall is good and ordering is bad, and because the GPU path changes the
@@ -71,10 +73,12 @@ RERANK_BATCH_SIZE: int = int(os.environ.get("LP_DILIGENCE_RERANK_BATCH_SIZE", "1
 # Hybrid search
 # Fuse dense vector search with BM25 keyword search over the FTS5 index.
 #
-# ON by default. Measured 2026-07-28 over the 20-question golden set, hybrid
-# was the best configuration on every quality metric (faithfulness 0.91 vs
-# 0.84 baseline, context precision 0.71 vs 0.59, refusal correctness 0.80 vs
-# 0.75) at a cost of ~6 ms per query. Set LP_DILIGENCE_HYBRID=0 to disable.
+# ON by default. Over the 20-question golden set (re-graded 2026-09-25), hybrid
+# is at least as good as every other configuration on judged quality (all
+# within 0.03) and leads slightly on refusal correctness (0.80 vs 0.75) and
+# keyword match (0.85 vs 0.75), at ~6 ms per query. Those leads are one or two
+# questions, so the case for it is "no worse, nearly free", not "clearly
+# better". Set LP_DILIGENCE_HYBRID=0 to disable.
 HYBRID_ENABLED: bool = os.environ.get("LP_DILIGENCE_HYBRID", "1").strip().lower() in {"1", "true", "yes", "on"}
 # Candidates pulled from each retriever before fusion.
 HYBRID_CANDIDATES: int = int(os.environ.get("LP_DILIGENCE_HYBRID_CANDIDATES", "25"))
